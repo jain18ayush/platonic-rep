@@ -33,7 +33,6 @@ from datasets import load_dataset
 from tasks import get_models
 from models import load_llm, load_tokenizer
 from metrics import remove_outliers
-from measure_alignment import prepare_features, compute_score
 import utils
 
 
@@ -178,11 +177,25 @@ def run_extract(args):
 # Stage 2: Analyze
 # ---------------------------------------------------------------------------
 
+def fast_mutual_knn(knn_a, knn_b, n, topk):
+    """Mutual KNN from precomputed KNN indices — no matmul needed."""
+    range_tensor = torch.arange(n, device=knn_a.device).unsqueeze(1)
+    mask_a = torch.zeros(n, n, device=knn_a.device)
+    mask_b = torch.zeros(n, n, device=knn_b.device)
+    mask_a[range_tensor, knn_a] = 1.0
+    mask_b[range_tensor, knn_b] = 1.0
+    return ((mask_a * mask_b).sum(dim=1) / topk).mean().item()
+
+
 def run_analyze(args):
     llm_models, lvm_models = get_models("val", modality="all")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    topk = 10
 
     # --- Per-model analysis: load features, compute PR per layer ---
+    # Also precompute KNN indices for each layer to avoid redundant computation
     model_info = {}
+    model_knn = {}  # model_name -> list of KNN index tensors per layer
 
     for modality, model_list, pool in [("language", llm_models, "avg"), ("vision", lvm_models, "cls")]:
         for model_name in model_list:
@@ -199,13 +212,22 @@ def run_analyze(args):
             num_layers = feats.shape[1]
 
             pr_per_layer = []
+            knn_per_layer = []
             for layer_idx in range(num_layers):
-                layer_feats = feats[:, layer_idx, :]
+                layer_feats = feats[:, layer_idx, :].to(device)
                 # remove outliers + normalize (same preprocessing as alignment)
-                layer_feats = remove_outliers(layer_feats, q=0.95)
-                layer_feats = F.normalize(layer_feats, p=2, dim=-1)
-                pr = participation_ratio(layer_feats).item()
+                layer_feats = remove_outliers(layer_feats, q=0.95, exact=True)
+                layer_feats_norm = F.normalize(layer_feats, p=2, dim=-1)
+
+                # PR computation on GPU
+                pr = participation_ratio(layer_feats_norm).item()
                 pr_per_layer.append(pr)
+
+                # Precompute KNN indices for this layer
+                knn = (layer_feats_norm @ layer_feats_norm.T).fill_diagonal_(-1e8).argsort(dim=1, descending=True)[:, :topk]
+                knn_per_layer.append(knn)  # keep on GPU
+
+                del layer_feats, layer_feats_norm
 
             model_info[model_name] = {
                 "num_params": num_params,
@@ -213,11 +235,12 @@ def run_analyze(args):
                 "pr_per_layer": pr_per_layer,
                 "pr_last_layer": pr_per_layer[-1],
             }
+            model_knn[model_name] = knn_per_layer
             print(f"{model_name}: params={num_params:,}  layers={num_layers}  PR_last={pr_per_layer[-1]:.1f}")
 
             del data, feats
 
-    # --- Pair analysis: cross-modal alignment + dimensionality gap ---
+    # --- Pair analysis: cross-modal alignment using precomputed KNN ---
     pair_analysis = []
     available_llms = [m for m in llm_models if m in model_info]
     available_lvms = [m for m in lvm_models if m in model_info]
@@ -226,23 +249,22 @@ def run_analyze(args):
     print(f"\nComputing alignment for {total_pairs} cross-modal pairs...")
 
     for lang_model in tqdm(available_llms, desc="LLM"):
-        lang_path = utils.to_feature_filename(
-            FEATURE_DIR, DATASET_NAME, SUBSET, lang_model, pool="avg"
-        )
-        raw_lang = torch.load(lang_path, map_location="cuda:0")["feats"].float()
-        lang_feats = prepare_features(raw_lang, exact=True)
+        lang_knns = model_knn[lang_model]
+        n = lang_knns[0].shape[0]
 
         for vision_model in available_lvms:
-            vision_path = utils.to_feature_filename(
-                FEATURE_DIR, DATASET_NAME, SUBSET, vision_model, pool="cls"
-            )
-            raw_vision = torch.load(vision_path, map_location="cuda:0")["feats"].float()
-            vision_feats = prepare_features(raw_vision, exact=True)
+            vision_knns = model_knn[vision_model]
 
-            score, best_layers = compute_score(
-                lang_feats, vision_feats, metric="mutual_knn", topk=10
-            )
-            # best_layers = (lang_layer_idx, vision_layer_idx)
+            best_score = 0
+            best_layers = (0, 0)
+
+            for i, knn_lang in enumerate(lang_knns):
+                for j, knn_vis in enumerate(vision_knns):
+                    score = fast_mutual_knn(knn_lang, knn_vis, n=n, topk=topk)
+                    if score > best_score:
+                        best_score = score
+                        best_layers = (i, j)
+
             lang_layer_idx, vision_layer_idx = best_layers
 
             pr_lang = model_info[lang_model]["pr_per_layer"][lang_layer_idx]
@@ -256,7 +278,7 @@ def run_analyze(args):
             pair_analysis.append({
                 "lang_model": lang_model,
                 "vision_model": vision_model,
-                "alignment_score": score,
+                "alignment_score": best_score,
                 "best_layers": [lang_layer_idx, vision_layer_idx],
                 "pr_at_best_lang": pr_lang,
                 "pr_at_best_vision": pr_vision,
@@ -264,11 +286,9 @@ def run_analyze(args):
                 "dim_gap_last_layer": dim_gap_last,
             })
 
-            del vision_feats
-            torch.cuda.empty_cache()
-
-        del lang_feats
-        torch.cuda.empty_cache()
+    # Free KNN cache
+    del model_knn
+    torch.cuda.empty_cache()
 
     # Save results
     os.makedirs(ANALYSIS_DIR, exist_ok=True)
