@@ -13,7 +13,7 @@ def get_models(modelset, modality='all'):
             # "bigscience/bloomz-7b1",
             # "openlm-research/open_llama_3b",
             # "openlm-research/open_llama_7b",
-            "openlm-research/open_llama_13b",
+            # "openlm-research/open_llama_13b",
             "huggyllama/llama-7b",
             "huggyllama/llama-13b",
             "huggyllama/llama-30b",
