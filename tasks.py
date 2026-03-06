@@ -6,16 +6,16 @@ def get_models(modelset, modality='all'):
     
     if modelset == 'val':
         llm_models = [
-            # "bigscience/bloomz-560m",
-            # "bigscience/bloomz-1b1",
-            # "bigscience/bloomz-1b7",
-            # "bigscience/bloomz-3b",
-            # "bigscience/bloomz-7b1",
-            # "openlm-research/open_llama_3b",
-            # "openlm-research/open_llama_7b",
-            # "openlm-research/open_llama_13b",
-            # "huggyllama/llama-7b",
-            # "huggyllama/llama-13b",
+            "bigscience/bloomz-560m",
+            "bigscience/bloomz-1b1",
+            "bigscience/bloomz-1b7",
+            "bigscience/bloomz-3b",
+            "bigscience/bloomz-7b1",
+            "openlm-research/open_llama_3b",
+            "openlm-research/open_llama_7b",
+            "openlm-research/open_llama_13b",
+            "huggyllama/llama-7b",
+            "huggyllama/llama-13b",
             "huggyllama/llama-30b",
             "huggyllama/llama-65b",
         ]
